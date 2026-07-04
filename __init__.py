@@ -31,7 +31,7 @@ from .base import ODE, SDE, Sampleable, Simulator
 from .simulators import DDIMSimulator, EulerMaruyamaSimulator, EulerSimulator, HeunSimulator
 
 # Schedules — flow matching
-from .schedules import Alpha, Beta, LinearAlpha, LinearBeta, SquareRootBeta
+from .schedules import Alpha, Beta, LinearAlpha, LinearBeta, SquareRootBeta, get_gt
 
 # Schedules — diffusion
 from .schedules import (
@@ -66,7 +66,7 @@ __all__ = [
     # Simulators
     "EulerSimulator", "EulerMaruyamaSimulator", "HeunSimulator", "DDIMSimulator",
     # Schedules — flow matching
-    "Alpha", "Beta", "LinearAlpha", "LinearBeta", "SquareRootBeta",
+    "Alpha", "Beta", "LinearAlpha", "LinearBeta", "SquareRootBeta", "get_gt",
     # Schedules — diffusion
     "DiffusionNoiseSchedule", "LinearDiffusionSchedule", "CosineDiffusionSchedule",
     # Paths

@@ -207,11 +207,18 @@ class LinearConditionalProbabilityPath(ConditionalProbabilityPath):
     
     Closed-form conditional vector field:
         u_t(x|z) = (z − x) / (1 − t)
-    
+
+    Closed-form conditional / marginal scores (source X_0 ~ N(0, σ²I)):
+        conditional   p_t(x|z) = N(t·z, ((1−t)·σ)²·I)
+            ∇_x log p_t(x|z) = (t·z − x) / ((1−t)²·σ²)
+        marginal (from a learned velocity field v, stochastic-interpolant identity)
+            v(x,t) = (1/t)·(x + σ²·(1−t)·s)  ⇒  s = (t·v − x) / (σ²·(1−t))
+
     Note:
-        This diverges as t → 1 and should not be evaluated exactly at t = 1.
+        Both the vector field and the scores diverge as t → 1 and must not be
+        evaluated exactly at t = 1.
     """
-    
+
     def __init__(self, p_data, p_simple=None, p_simple_shape=None):
         """
         Initialize linear conditional path.
@@ -232,6 +239,8 @@ class LinearConditionalProbabilityPath(ConditionalProbabilityPath):
                 "p_simple or p_simple_shape."
             )
         super().__init__(base, p_data)
+        # Std of the Gaussian source X_0 ~ N(0, σ²I); used by the score formulas.
+        self.sigma = float(getattr(base, "std", 1.0))
         # Register a dummy buffer to track device
         self.register_buffer('_dummy', torch.zeros(1))
     
@@ -292,17 +301,52 @@ class LinearConditionalProbabilityPath(ConditionalProbabilityPath):
     
     def conditional_score(self, x: torch.Tensor, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
-        Conditional score — not available in closed form for linear paths.
-        
-        For linear paths p_t(x|z) is the pushforward of p_simple under a
-        deterministic map, making the score generally intractable.
-        
-        Raises:
-            NotImplementedError: Always.
+        Closed-form conditional score ∇_x log p_t(x|z).
+
+        With a Gaussian source X_0 ~ N(0, σ²I) and the linear interpolation
+        x_t = (1−t)·X_0 + t·z, the conditional is Gaussian:
+            p_t(x|z) = N(t·z, ((1−t)·σ)²·I)
+        so its score is closed-form:
+            ∇_x log p_t(x|z) = (t·z − x) / ((1−t)²·σ²)
+
+        Args:
+            x (torch.Tensor): Position.            Shape: (bs, *dims)
+            z (torch.Tensor): Conditioning sample. Shape: (bs, *dims)
+            t (torch.Tensor): Time in [0, 1).      Shape broadcastable to x.
+
+        Returns:
+            torch.Tensor: Conditional score, same shape as x.
+
+        Warning:
+            Diverges at t = 1; do not evaluate exactly there.
         """
-        raise NotImplementedError(
-            "LinearConditionalProbabilityPath does not provide a closed-form conditional score."
-        )
+        t = t.to(x.device)
+        return (t * z - x) / ((1.0 - t) ** 2 * self.sigma ** 2)
+
+    def velocity_to_score(self, x: torch.Tensor, v: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Convert a (learned) marginal velocity field to the marginal score.
+
+        Stochastic-interpolant identity for x_t = (1−t)·X_0 + t·X_1 with
+        X_0 ~ N(0, σ²I):
+            v(x,t) = (1/t)·(x + σ²·(1−t)·s)   ⇒   s = (t·v − x) / (σ²·(1−t))
+
+        This is the relation used to drive stochastic (SDE) sampling from a
+        velocity-prediction flow model (cf. SeqFlow_v4 ``vf_to_score``).
+
+        Args:
+            x (torch.Tensor): Current state x_t.       Shape: (bs, *dims)
+            v (torch.Tensor): Marginal velocity v(x_t,t). Shape: (bs, *dims)
+            t (torch.Tensor): Time in [0, 1).          Shape broadcastable to x.
+
+        Returns:
+            torch.Tensor: Marginal score ∇_x log p_t(x), same shape as x.
+
+        Warning:
+            Requires t < 1 (diverges at t = 1).
+        """
+        t = t.to(x.device)
+        return (t * v - x) / (self.sigma ** 2 * (1.0 - t))
 
 
 class IsotropicGaussian(torch.nn.Module):

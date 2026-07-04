@@ -146,18 +146,20 @@ class DDIMSimulator:
             sqrt_ab_next  = schedule.sqrt_alpha_bar(t_next_batch)
             sqrt_1mab_next = schedule.sqrt_one_minus_alpha_bar(t_next_batch)
 
-            # DDIM deterministic direction
-            x = sqrt_ab_next * x0_pred + sqrt_1mab_next * eps_pred
-
             if self.eta > 0.0:
-                # Add stochastic noise (η > 0)
-                sqrt_ab_now = schedule.sqrt_alpha_bar(t_batch)
-                sqrt_1mab_now = schedule.sqrt_one_minus_alpha_bar(t_batch)
+                # Stochastic DDIM (Song et al., 2020, Eq. 12): the deterministic
+                # direction coefficient is √(1−ᾱ_next−σ²), and σ·z is added.
+                ab_now  = schedule.sqrt_alpha_bar(t_batch) ** 2
+                ab_next = sqrt_ab_next ** 2
                 sigma = self.eta * torch.sqrt(
-                    (1 - sqrt_ab_next**2) / (1 - sqrt_ab_now**2).clamp(min=1e-8)
-                    * (1 - sqrt_ab_now**2 / sqrt_ab_next**2).clamp(min=0.0)
+                    ((1 - ab_next) / (1 - ab_now).clamp(min=1e-8))
+                    * (1 - ab_now / ab_next.clamp(min=1e-8)).clamp(min=0.0)
                 )
-                x = x + sigma * torch.randn_like(x)
+                dir_coef = torch.sqrt((1 - ab_next - sigma ** 2).clamp(min=0.0))
+                x = sqrt_ab_next * x0_pred + dir_coef * eps_pred + sigma * torch.randn_like(x)
+            else:
+                # Deterministic DDIM (η = 0).
+                x = sqrt_ab_next * x0_pred + sqrt_1mab_next * eps_pred
 
         return x
 

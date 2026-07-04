@@ -167,6 +167,62 @@ class LinearDiffusionSchedule(DiffusionNoiseSchedule):
         )
 
 
+# ---------------------------------------------------------------------------
+# Diffusion-coefficient schedule g(t) for stochastic flow-matching sampling
+# ---------------------------------------------------------------------------
+
+def get_gt(
+    t: torch.Tensor,
+    mode: str = "1/t",
+    param: float = 1.0,
+    clamp_val: float | None = None,
+    eps: float = 1e-2,
+) -> torch.Tensor:
+    """Diffusion coefficient g(t) for stochastic (SDE) rectified-flow sampling.
+
+    Ported from SeqFlow_v4 / Proteina. Used together with
+    :meth:`LinearConditionalProbabilityPath.velocity_to_score` to turn a
+    deterministic flow into a reverse SDE:
+        dx = (v + g(t)·s)·dt + sqrt(2·g(t)·η·dt)·ε
+
+    Args:
+        t:         Times in [0, 1), shape (nsteps,) or broadcastable.
+        mode:      "us" → (1−t)/t, "tan" → (π/2)·tan((1−t)·π/2), "1/t" → 1/t.
+        param:     Power for the optional log-sigmoid reshaping (1.0 = identity).
+        clamp_val: Upper clamp on g(t) (None = no upper clamp).
+        eps:       Numerical stabiliser in the denominator.
+
+    Returns:
+        g(t) tensor, same shape as ``t``.
+    """
+    def transform_gt(gt: torch.Tensor, f_pow: float = 1.0) -> torch.Tensor:
+        # Reshape the schedule via a normalised log-sigmoid power transform.
+        if f_pow == 1.0:
+            return gt
+        log_gt = torch.log(gt)
+        mean_log_gt = torch.mean(log_gt)
+        centered = log_gt - mean_log_gt
+        normalized = torch.sigmoid(centered) ** f_pow
+        rec = torch.logit(normalized, eps=1e-6) + mean_log_gt
+        return torch.exp(rec)
+
+    t = torch.clamp(t, 0.0, 1.0 - 1e-5)
+    if mode == "us":
+        gt = (1.0 - t) / (t + eps)
+    elif mode == "tan":
+        gt = (torch.pi / 2.0) * torch.sin((1.0 - t) * torch.pi / 2.0) / (
+            torch.cos((1.0 - t) * torch.pi / 2.0) + eps
+        )
+    elif mode == "1/t":
+        gt = 1.0 / (t + eps)
+    else:
+        raise NotImplementedError(f"Unknown gt mode: {mode!r}. Choose 'us', 'tan', or '1/t'.")
+
+    gt = transform_gt(gt, f_pow=param)
+    gt = torch.clamp(gt, min=0.0, max=clamp_val)  # max=None → no upper clamp
+    return gt
+
+
 class CosineDiffusionSchedule(DiffusionNoiseSchedule):
     """
     Cosine noise schedule (Nichol & Dhariwal, Improved DDPM, 2021).
