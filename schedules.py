@@ -1,5 +1,5 @@
 """
-Time schedules for conditional probability paths - Production Version
+Time schedules for conditional probability paths and diffusion.
 
 Provides α_t and β_t schedules for interpolating between distributions,
 plus noise schedules (variance, SNR) for diffusion models (DDPM/DDIM).
@@ -24,10 +24,10 @@ class Alpha(ABC):
     
     def __init__(self):
         # Verify boundary conditions
-        assert torch.allclose(self(torch.zeros(1, 1, 1, 1)), torch.zeros(1, 1, 1, 1)), \
-            "Alpha schedule must satisfy α_0 = 0"
-        assert torch.allclose(self(torch.ones(1, 1, 1, 1)), torch.ones(1, 1, 1, 1)), \
-            "Alpha schedule must satisfy α_1 = 1"
+        if not torch.allclose(self(torch.zeros(1)), torch.zeros(1)):
+            raise ValueError("Alpha schedule must satisfy alpha(0) = 0")
+        if not torch.allclose(self(torch.ones(1)), torch.ones(1)):
+            raise ValueError("Alpha schedule must satisfy alpha(1) = 1")
     
     @abstractmethod
     def __call__(self, t: torch.Tensor) -> torch.Tensor:
@@ -49,10 +49,10 @@ class Beta(ABC):
     
     def __init__(self):
         # Verify boundary conditions
-        assert torch.allclose(self(torch.zeros(1, 1, 1, 1)), torch.ones(1, 1, 1, 1)), \
-            "Beta schedule must satisfy β_0 = 1"
-        assert torch.allclose(self(torch.ones(1, 1, 1, 1)), torch.zeros(1, 1, 1, 1)), \
-            "Beta schedule must satisfy β_1 = 0"
+        if not torch.allclose(self(torch.zeros(1)), torch.ones(1)):
+            raise ValueError("Beta schedule must satisfy beta(0) = 1")
+        if not torch.allclose(self(torch.ones(1)), torch.zeros(1)):
+            raise ValueError("Beta schedule must satisfy beta(1) = 0")
     
     @abstractmethod
     def __call__(self, t: torch.Tensor) -> torch.Tensor:
@@ -141,20 +141,28 @@ class DiffusionNoiseSchedule(ABC):
 
 class LinearDiffusionSchedule(DiffusionNoiseSchedule):
     """
-    DDPM linear β schedule (Ho et al., 2020).
+    Continuous variance-preserving linear β schedule.
 
-    β_t = β_min + (β_max − β_min) · t / T  (continuous approximation)
+    β(t) = β_min + (β_max − β_min) · t
     ᾱ_t = exp(−∫₀ᵗ β_s ds)
 
     Args:
-        beta_min: Minimum β value (default: 1e-4 per original DDPM)
-        beta_max: Maximum β value (default: 0.02  per original DDPM)
+        beta_min: Initial continuous noise rate.
+        beta_max: Final continuous noise rate.
+
+    Note:
+        These are continuous-time rates, not the per-step ``1e-4`` to
+        ``0.02`` betas commonly used by a 1000-step discrete DDPM.
     """
 
-    def __init__(self, beta_min: float = 1e-4, beta_max: float = 0.02):
+    def __init__(self, beta_min: float = 0.1, beta_max: float = 20.0):
+        if beta_min <= 0.0:
+            raise ValueError("beta_min must be positive")
+        if beta_max < beta_min:
+            raise ValueError("beta_max must be greater than or equal to beta_min")
         self.beta_min = beta_min
         self.beta_max = beta_max
-        log.debug("LinearDiffusionSchedule: β_min=%.1e  β_max=%.2f", beta_min, beta_max)
+        log.debug("LinearDiffusionSchedule: β_min=%.3f  β_max=%.3f", beta_min, beta_max)
 
     def beta(self, t: torch.Tensor) -> torch.Tensor:
         """Instantaneous noise rate β_t."""
@@ -234,6 +242,8 @@ class CosineDiffusionSchedule(DiffusionNoiseSchedule):
     """
 
     def __init__(self, s: float = 0.008):
+        if not 0.0 <= s < 1.0:
+            raise ValueError("s must satisfy 0 <= s < 1")
         self.s = s
         self._cos0 = torch.cos(torch.tensor(s / (1.0 + s) * torch.pi / 2)).item() ** 2
         log.debug("CosineDiffusionSchedule: s=%.4f", s)

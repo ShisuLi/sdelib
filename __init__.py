@@ -1,5 +1,5 @@
 """
-SDELib - Production-Ready Flow Matching & Diffusion Library
+Small, explicit building blocks for flow matching and diffusion models.
 
 Supports three modern generative modelling paradigms:
 

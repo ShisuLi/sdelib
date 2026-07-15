@@ -1,10 +1,10 @@
 """
-Numerical simulators for ODEs and SDEs - Production Version
+Numerical simulators for ODEs and SDEs.
 
 Implementations:
   - EulerSimulator          : 1st-order ODE solver (flow matching / rectified flow)
   - EulerMaruyamaSimulator  : 1st-order SDE solver (diffusion reverse SDE)
-  - HeunSimulator           : 2nd-order ODE solver (better quality, same NFE cost)
+  - HeunSimulator           : 2nd-order ODE solver (two evaluations per step)
   - DDIMSimulator           : Deterministic DDIM sampler for diffusion models
 """
 
@@ -14,7 +14,7 @@ import logging
 
 import torch
 
-from .base import ODE, SDE, Simulator
+from .base import ODE, SDE, Simulator, _expand_batch_time
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +32,8 @@ class EulerSimulator(Simulator):
     
     def step(self, xt: torch.Tensor, t: torch.Tensor, h: torch.Tensor, **kwargs) -> torch.Tensor:
         """Perform one Euler step."""
+        t = _expand_batch_time(t, xt)
+        h = _expand_batch_time(h, xt, dtype=xt.dtype)
         drift = self.ode.drift_coefficient(xt, t, **kwargs)
         return xt + h * drift
 
@@ -50,6 +52,8 @@ class EulerMaruyamaSimulator(Simulator):
 
     def step(self, xt: torch.Tensor, t: torch.Tensor, h: torch.Tensor, **kwargs) -> torch.Tensor:
         """Perform one Euler-Maruyama step."""
+        t = _expand_batch_time(t, xt)
+        h = _expand_batch_time(h, xt, dtype=xt.dtype)
         drift = self.sde.drift_coefficient(xt, t, **kwargs)
         diffusion = self.sde.diffusion_coefficient(xt, t, **kwargs)
         # Brownian increment: √h · Z_t,  Z_t ~ N(0, I)
@@ -78,6 +82,8 @@ class HeunSimulator(Simulator):
 
     def step(self, xt: torch.Tensor, t: torch.Tensor, h: torch.Tensor, **kwargs) -> torch.Tensor:
         """Perform one Heun step (predictor + corrector)."""
+        t = _expand_batch_time(t, xt)
+        h = _expand_batch_time(h, xt, dtype=xt.dtype)
         u1 = self.ode.drift_coefficient(xt, t, **kwargs)
         x_pred = xt + h * u1
         t_next = t + h
@@ -96,7 +102,7 @@ class DDIMSimulator:
 
     The ``path`` argument must be a ``DiffusionPath`` instance (see paths.py).
     The denoising network ``net`` has signature ``net(x, t, **kwargs) → prediction``,
-    where ``t`` is shape (B, 1, 1, 1) with values in [0, 1].
+    where ``t`` has shape ``(B, 1, ..., 1)`` and values in [0, 1).
 
     Args:
         net:   Denoising network.
@@ -105,9 +111,54 @@ class DDIMSimulator:
     """
 
     def __init__(self, net, path, eta: float = 0.0):
+        if eta < 0.0:
+            raise ValueError("eta must be non-negative")
         self.net = net
         self.path = path
         self.eta = eta
+
+    @staticmethod
+    def _validate_times(ts: torch.Tensor) -> None:
+        if ts.ndim != 1 or ts.numel() < 2:
+            raise ValueError("ts must be one-dimensional with at least two times")
+        if not torch.all(ts[:-1] > ts[1:]):
+            raise ValueError("ts must be strictly decreasing")
+        if ts[0] >= 1.0 or ts[-1] < 0.0:
+            raise ValueError("DDIM times must satisfy 0 <= ts[-1] < ts[0] < 1")
+
+    def _step(
+        self,
+        x: torch.Tensor,
+        t_now: torch.Tensor,
+        t_next: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Apply one DDIM update for endpoint or trajectory sampling."""
+        t_batch = _expand_batch_time(t_now, x)
+        t_next_batch = _expand_batch_time(t_next, x)
+        net_out = self.net(x, t_batch, **kwargs)
+
+        x0_pred = self.path.predict_x0_from_net(x, net_out, t_batch)
+        eps_pred = self.path.predict_noise_from_net(x, net_out, t_batch)
+        schedule = self.path.schedule
+        sqrt_ab_next = schedule.sqrt_alpha_bar(t_next_batch)
+
+        if self.eta == 0.0:
+            sqrt_1mab_next = schedule.sqrt_one_minus_alpha_bar(t_next_batch)
+            return sqrt_ab_next * x0_pred + sqrt_1mab_next * eps_pred
+
+        ab_now = schedule.alpha_bar(t_batch)
+        ab_next = schedule.alpha_bar(t_next_batch)
+        sigma = self.eta * torch.sqrt(
+            ((1.0 - ab_next) / (1.0 - ab_now).clamp(min=1e-8))
+            * (1.0 - ab_now / ab_next.clamp(min=1e-8)).clamp(min=0.0)
+        )
+        direction = torch.sqrt((1.0 - ab_next - sigma.square()).clamp(min=0.0))
+        return (
+            sqrt_ab_next * x0_pred
+            + direction * eps_pred
+            + sigma * torch.randn_like(x)
+        )
 
     @torch.no_grad()
     def simulate(
@@ -120,46 +171,18 @@ class DDIMSimulator:
         Run DDIM sampling from x_T (noisy) → x_0 (clean).
 
         Args:
-            x:   Initial noise.  Shape: (B, C, H, W)
+            x:   Initial noise. Shape: (B, *sample_shape)
             ts:  Decreasing time sequence in [0, 1], shape (num_steps,).
-                 e.g. ``torch.linspace(1, 0, 51)[:-1]`` (exclude 0 for stability).
+                 For example ``torch.linspace(1 - 1e-4, 0, 51)``.
             **kwargs: Passed to the denoising network (e.g. y=labels).
 
         Returns:
-            Denoised samples at t=0.  Shape: (B, C, H, W)
+            Samples at ``ts[-1]``, with the same shape as ``x``.
         """
-        assert ts[0] > ts[-1], "ts must be a decreasing sequence (T → 0)"
-        B = x.shape[0]
-        schedule = self.path.schedule
+        self._validate_times(ts)
 
         for i in range(len(ts) - 1):
-            t_now  = ts[i]
-            t_next = ts[i + 1]
-
-            t_batch = t_now.view(1, 1, 1, 1).expand(B, 1, 1, 1).to(x.device)
-            net_out = self.net(x, t_batch, **kwargs)
-
-            x0_pred = self.path.predict_x0_from_net(x, net_out, t_batch)
-            eps_pred = self.path.predict_noise_from_net(x, net_out, t_batch)
-
-            t_next_batch = t_next.view(1, 1, 1, 1).expand(B, 1, 1, 1).to(x.device)
-            sqrt_ab_next  = schedule.sqrt_alpha_bar(t_next_batch)
-            sqrt_1mab_next = schedule.sqrt_one_minus_alpha_bar(t_next_batch)
-
-            if self.eta > 0.0:
-                # Stochastic DDIM (Song et al., 2020, Eq. 12): the deterministic
-                # direction coefficient is √(1−ᾱ_next−σ²), and σ·z is added.
-                ab_now  = schedule.sqrt_alpha_bar(t_batch) ** 2
-                ab_next = sqrt_ab_next ** 2
-                sigma = self.eta * torch.sqrt(
-                    ((1 - ab_next) / (1 - ab_now).clamp(min=1e-8))
-                    * (1 - ab_now / ab_next.clamp(min=1e-8)).clamp(min=0.0)
-                )
-                dir_coef = torch.sqrt((1 - ab_next - sigma ** 2).clamp(min=0.0))
-                x = sqrt_ab_next * x0_pred + dir_coef * eps_pred + sigma * torch.randn_like(x)
-            else:
-                # Deterministic DDIM (η = 0).
-                x = sqrt_ab_next * x0_pred + sqrt_1mab_next * eps_pred
+            x = self._step(x, ts[i], ts[i + 1], **kwargs)
 
         return x
 
@@ -174,26 +197,13 @@ class DDIMSimulator:
         Run DDIM and record all intermediate states.
 
         Returns:
-            Trajectory tensor, shape (B, num_steps, C, H, W).
+            Trajectory tensor, shape (B, num_steps, *sample_shape).
         """
-        assert ts[0] > ts[-1], "ts must be a decreasing sequence (T → 0)"
-        B = x.shape[0]
-        schedule = self.path.schedule
+        self._validate_times(ts)
         trajectory = [x]
 
         for i in range(len(ts) - 1):
-            t_now  = ts[i]
-            t_next = ts[i + 1]
-
-            t_batch = t_now.view(1, 1, 1, 1).expand(B, 1, 1, 1).to(x.device)
-            net_out = self.net(x, t_batch, **kwargs)
-            x0_pred  = self.path.predict_x0_from_net(x, net_out, t_batch)
-            eps_pred = self.path.predict_noise_from_net(x, net_out, t_batch)
-
-            t_next_batch = t_next.view(1, 1, 1, 1).expand(B, 1, 1, 1).to(x.device)
-            sqrt_ab_next   = schedule.sqrt_alpha_bar(t_next_batch)
-            sqrt_1mab_next = schedule.sqrt_one_minus_alpha_bar(t_next_batch)
-            x = sqrt_ab_next * x0_pred + sqrt_1mab_next * eps_pred
+            x = self._step(x, ts[i], ts[i + 1], **kwargs)
             trajectory.append(x)
 
         return torch.stack(trajectory, dim=1)

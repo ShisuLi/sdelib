@@ -1,5 +1,5 @@
 """
-Conditional probability paths for flow matching and diffusion - Production Version
+Conditional probability paths for flow matching and diffusion.
 
 Defines probability paths p_t(x|z) for conditional generation:
   - GaussianConditionalProbabilityPath  (Gaussian flow matching)
@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
-from einops import rearrange
-
 log = logging.getLogger(__name__)
+
+
+def _require_open_unit_time(t: torch.Tensor, operation: str) -> None:
+    """Reject times where formulas containing ``1 / (1 - t)`` are singular."""
+    if torch.any((t < 0.0) | (t >= 1.0)):
+        raise ValueError(f"{operation} requires every time to satisfy 0 <= t < 1")
 
 
 class ConditionalProbabilityPath(torch.nn.Module, ABC):
@@ -153,7 +157,7 @@ class GaussianConditionalProbabilityPath(ConditionalProbabilityPath):
         
         # Sample noise
         noise, _ = self.p_simple.sample(z.shape[0])
-        noise = noise.to(z.device)
+        noise = noise.to(device=z.device, dtype=z.dtype)
         
         # Apply Gaussian conditional: x = α_t·z + β_t·ε
         return alpha_t * z + beta_t * noise
@@ -174,6 +178,8 @@ class GaussianConditionalProbabilityPath(ConditionalProbabilityPath):
         beta_t = self.beta(t)
         dt_alpha_t = self.alpha.dt(t)
         dt_beta_t = self.beta.dt(t)
+        if torch.any(beta_t == 0.0):
+            raise ValueError("conditional vector field is undefined where beta(t) is zero")
         
         return dt_alpha_t * z + (dt_beta_t / beta_t) * (x - alpha_t * z)
     
@@ -191,6 +197,8 @@ class GaussianConditionalProbabilityPath(ConditionalProbabilityPath):
         """
         alpha_t = self.alpha(t)
         beta_t = self.beta(t)
+        if torch.any(beta_t == 0.0):
+            raise ValueError("conditional score is undefined where beta(t) is zero")
         
         return (alpha_t * z - x) / (beta_t ** 2)
 
@@ -241,8 +249,6 @@ class LinearConditionalProbabilityPath(ConditionalProbabilityPath):
         super().__init__(base, p_data)
         # Std of the Gaussian source X_0 ~ N(0, σ²I); used by the score formulas.
         self.sigma = float(getattr(base, "std", 1.0))
-        # Register a dummy buffer to track device
-        self.register_buffer('_dummy', torch.zeros(1))
     
     def sample_conditioning_variable(self, num_samples: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -275,8 +281,8 @@ class LinearConditionalProbabilityPath(ConditionalProbabilityPath):
                 Shape: (bs, c, h, w)
         """
         x0, _ = self.p_simple.sample(z.shape[0])
-        x0 = x0.to(z.device)  # Ensure x0 is on the same device as z
-        t = t.to(z.device)    # Ensure t is on the same device as z
+        x0 = x0.to(device=z.device, dtype=z.dtype)
+        t = t.to(device=z.device, dtype=z.dtype)
         xt = (1 - t) * x0 + t * z
         return xt
     
@@ -296,7 +302,8 @@ class LinearConditionalProbabilityPath(ConditionalProbabilityPath):
         Warning:
             Undefined at t = 1; avoid evaluating exactly there.
         """
-        t = t.to(x.device)  # Ensure t is on the same device as x
+        _require_open_unit_time(t, "conditional vector field")
+        t = t.to(device=x.device, dtype=x.dtype)
         return (z - x) / (1 - t)
     
     def conditional_score(self, x: torch.Tensor, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -320,7 +327,8 @@ class LinearConditionalProbabilityPath(ConditionalProbabilityPath):
         Warning:
             Diverges at t = 1; do not evaluate exactly there.
         """
-        t = t.to(x.device)
+        _require_open_unit_time(t, "conditional score")
+        t = t.to(device=x.device, dtype=x.dtype)
         return (t * z - x) / ((1.0 - t) ** 2 * self.sigma ** 2)
 
     def velocity_to_score(self, x: torch.Tensor, v: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -345,7 +353,8 @@ class LinearConditionalProbabilityPath(ConditionalProbabilityPath):
         Warning:
             Requires t < 1 (diverges at t = 1).
         """
-        t = t.to(x.device)
+        _require_open_unit_time(t, "velocity-to-score conversion")
+        t = t.to(device=x.device, dtype=x.dtype)
         return (t * v - x) / (self.sigma ** 2 * (1.0 - t))
 
 
@@ -358,9 +367,13 @@ class IsotropicGaussian(torch.nn.Module):
         std: Standard deviation (default: 1.0)
     """
 
-    def __init__(self, shape: List[int], std: float = 1.0):
+    def __init__(self, shape: Sequence[int], std: float = 1.0):
         super().__init__()
-        self.shape = shape
+        if not shape or any(size <= 0 for size in shape):
+            raise ValueError("shape must contain positive dimensions")
+        if std <= 0.0:
+            raise ValueError("std must be positive")
+        self.shape = tuple(shape)
         self.std = std
         # Register buffer to track device
         self.register_buffer("_dummy", torch.zeros(1))
@@ -370,7 +383,7 @@ class IsotropicGaussian(torch.nn.Module):
         """Get the device this module is on."""
         return self._dummy.device
 
-    def sample(self, num_samples: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def sample(self, num_samples: int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Sample from N(0, σ²·I).
 
@@ -378,12 +391,13 @@ class IsotropicGaussian(torch.nn.Module):
             num_samples: Number of samples
 
         Returns:
-            Tuple of (samples, dummy_labels) — both on the same device as this module.
+            Tuple of ``(samples, None)``.
             samples shape: (num_samples, *shape)
         """
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
         samples = torch.randn(num_samples, *self.shape, device=self.device) * self.std
-        labels = torch.zeros(num_samples, dtype=torch.long, device=self.device)
-        return samples, labels
+        return samples, None
 
 
 # ---------------------------------------------------------------------------
@@ -410,9 +424,11 @@ class DiffusionPath(torch.nn.Module):
 
     def __init__(self, p_data, schedule, prediction_type: str = "epsilon"):
         super().__init__()
-        assert prediction_type in {"epsilon", "x0", "v"}, (
-            f"prediction_type must be 'epsilon', 'x0', or 'v', got '{prediction_type}'"
-        )
+        if prediction_type not in {"epsilon", "x0", "v"}:
+            raise ValueError(
+                "prediction_type must be 'epsilon', 'x0', or 'v', "
+                f"got {prediction_type!r}"
+            )
         self.p_data = p_data
         self.schedule = schedule
         self.prediction_type = prediction_type
@@ -436,9 +452,9 @@ class DiffusionPath(torch.nn.Module):
         Sample x_t ~ q(x_t | x_0) = N(√ᾱ_t · x_0, (1−ᾱ_t)·I).
 
         Args:
-            x0:    Clean images.   Shape: (B, C, H, W)
-            t:     Continuous time in [0, 1].  Shape: (B, 1, 1, 1)
-            noise: Optional pre-sampled ε ~ N(0, I).  Shape same as x0.
+            x0:    Clean samples. Shape: (B, *sample_shape)
+            t:     Time in [0, 1], broadcastable to x0.
+            noise: Optional pre-sampled epsilon with the same shape as x0.
 
         Returns:
             (xt, noise) — noised samples and the noise used.
@@ -464,9 +480,9 @@ class DiffusionPath(torch.nn.Module):
         Return the prediction target for the denoising network.
 
         Args:
-            x0:    Clean images.  Shape: (B, C, H, W)
-            noise: Sampled ε.     Shape: (B, C, H, W)
-            t:     Time.          Shape: (B, 1, 1, 1)
+            x0:    Clean samples. Shape: (B, *sample_shape)
+            noise: Sampled epsilon with the same shape as x0.
+            t:     Time broadcastable to x0.
 
         Returns:
             target tensor, same shape as x0.

@@ -1,5 +1,5 @@
 """
-Process implementations for sampling - Production Version
+Process implementations for sampling.
 
 Provides:
   - CFGVectorFieldODE : classifier-free guidance ODE for flow matching inference

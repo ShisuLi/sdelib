@@ -1,13 +1,42 @@
 """
-Core abstract base classes for SDELib - Production Version
+Core abstract base classes for sdelib.
 
 Defines interfaces for ODEs, SDEs, simulators, and probability distributions.
-Simplified and optimized for production use.
+The interfaces are intentionally small and explicit.
 """
 
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple
+
 import torch
+
+
+def _expand_batch_time(
+    value: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Represent a scalar or per-sample time as ``(B, 1, ..., 1)``."""
+    if reference.ndim < 1:
+        raise ValueError("reference state must include a batch dimension")
+
+    value = value.to(device=reference.device, dtype=dtype or value.dtype)
+    batch_size = reference.shape[0]
+    if value.ndim == 0:
+        value = value.expand(batch_size)
+    elif value.shape[0] == 1 and batch_size != 1:
+        value = value.expand(batch_size, *value.shape[1:])
+    elif value.shape[0] != batch_size:
+        raise ValueError(
+            f"time batch dimension {value.shape[0]} does not match state batch {batch_size}"
+        )
+
+    if value.ndim > reference.ndim:
+        raise ValueError(
+            f"time rank {value.ndim} cannot exceed state rank {reference.ndim}"
+        )
+    return value.reshape(*value.shape, *((1,) * (reference.ndim - value.ndim)))
 
 
 class ODE(ABC):

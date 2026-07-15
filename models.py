@@ -1,12 +1,13 @@
 """
-Neural network models for flow matching - Production Version
+Neural network models used by the reference image experiments.
 
 Provides U-Net architecture with classifier-free guidance for conditional generation.
 """
 
-from abc import ABC, abstractmethod
-from typing import List
 import math
+from abc import ABC, abstractmethod
+from typing import Optional, Sequence
+
 import torch
 
 
@@ -16,7 +17,12 @@ class ConditionalVectorField(torch.nn.Module, ABC):
     """
     
     @abstractmethod
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Compute conditional vector field.
         
@@ -44,7 +50,8 @@ class FourierEncoder(torch.nn.Module):
     
     def __init__(self, dim: int):
         super().__init__()
-        assert dim % 2 == 0, "Embedding dimension must be even"
+        if dim < 2 or dim % 2 != 0:
+            raise ValueError("embedding dimension must be a positive even integer")
         self.half_dim = dim // 2
         self.register_buffer('weights', torch.randn(1, self.half_dim))
     
@@ -181,9 +188,15 @@ class UNet(ConditionalVectorField):
     """
     
     def __init__(self, in_channels: int = 1, out_channels: int = 1,
-                 channels: List[int] = [32, 64, 128], num_residual_layers: int = 2,
+                 channels: Sequence[int] = (32, 64, 128), num_residual_layers: int = 2,
                  t_embed_dim: int = 40, y_embed_dim: int = 40, num_classes: int = 11):
         super().__init__()
+        if len(channels) < 2 or any(channel < 1 for channel in channels):
+            raise ValueError("channels must contain at least two positive sizes")
+        if num_classes < 1:
+            raise ValueError("num_classes must be positive")
+
+        self.null_label = num_classes - 1
         
         self.init_conv = torch.nn.Sequential(
             torch.nn.Conv2d(in_channels, channels[0], kernel_size=3, padding=1),
@@ -207,7 +220,12 @@ class UNet(ConditionalVectorField):
         
         self.final_conv = torch.nn.Conv2d(channels[0], out_channels, kernel_size=3, padding=1)
     
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Forward pass.
         
@@ -219,6 +237,14 @@ class UNet(ConditionalVectorField):
         Returns:
             Vector field, shape (batch_size, out_channels, H, W)
         """
+        if y is None:
+            y = torch.full(
+                (x.shape[0],),
+                self.null_label,
+                dtype=torch.long,
+                device=x.device,
+            )
+
         t_embed = self.time_embedder(t)
         y_embed = self.y_embedder(y)
         

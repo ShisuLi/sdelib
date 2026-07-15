@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdelib"
+version = "1.1.0"
+description = "Small, explicit building blocks for flow matching and diffusion models."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "Shisu Li" }]
+dependencies = [
+    "torch==2.6.0",
+    "einops>=0.8,<0.9",
+    "tqdm>=4.66,<5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.8",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124", marker = "sys_platform == 'linux'" }
+
+[tool.setuptools]
+packages = ["sdelib"]
+package-dir = { sdelib = "." }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]

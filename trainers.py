@@ -1,5 +1,5 @@
 """
-Training utilities for flow matching and diffusion - Production Version
+Minimal training objectives for flow matching and diffusion.
 
 Trainers:
   - CFGTrainer            : Conditional flow matching with classifier-free guidance
@@ -24,6 +24,26 @@ def model_size_mb(model: torch.nn.Module) -> float:
     size = sum(p.nelement() * p.element_size() for p in model.parameters())
     size += sum(b.nelement() * b.element_size() for b in model.buffers())
     return size / (1024**2)
+
+
+def _sample_time_like(samples: torch.Tensor) -> torch.Tensor:
+    """Sample one continuous time per item, broadcastable to ``samples``."""
+    if samples.ndim < 1:
+        raise ValueError("samples must include a batch dimension")
+    shape = (samples.shape[0],) + (1,) * (samples.ndim - 1)
+    return torch.rand(shape, device=samples.device)
+
+
+def _mean_flat_mse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Mean squared error over every non-batch dimension."""
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"prediction shape {tuple(prediction.shape)} does not match "
+            f"target shape {tuple(target.shape)}"
+        )
+    if prediction.ndim < 1:
+        raise ValueError("prediction and target must include a batch dimension")
+    return (prediction - target).square().reshape(prediction.shape[0], -1).mean()
 
 
 class Trainer(ABC):
@@ -69,6 +89,11 @@ class Trainer(ABC):
         Returns:
             List[float] of per-step losses.
         """
+        if num_epochs < 1:
+            raise ValueError("num_epochs must be positive")
+        if lr <= 0.0:
+            raise ValueError("lr must be positive")
+
         log.info(
             "Starting training | steps=%d  lr=%.1e  model_size=%.2f MiB  device=%s",
             num_epochs, lr, model_size_mb(self.model), self.device,
@@ -110,7 +135,8 @@ class CFGTrainer(Trainer):
     """
 
     def __init__(self, path, model, eta: float, null_label: int = 10, device: Optional[str] = None):
-        assert 0 < eta < 1, "eta must be in (0, 1)"
+        if not 0.0 < eta < 1.0:
+            raise ValueError("eta must be in (0, 1)")
         super().__init__(model, device=device)
         self.eta = eta
         self.null_label = null_label
@@ -129,6 +155,8 @@ class CFGTrainer(Trainer):
         """
         z, y = self.path.p_data.sample(batch_size)
         z = z.to(self.device)
+        if y is None:
+            raise ValueError("CFG training requires one class label per sample")
         y = y.to(self.device)
 
         # Label dropout: y → ∅ with prob η
@@ -136,14 +164,13 @@ class CFGTrainer(Trainer):
         y = y.clone()
         y[mask] = self.null_label
 
-        t = torch.rand(batch_size, 1, 1, 1, device=self.device)
+        t = _sample_time_like(z)
         x = self.path.sample_conditional_path(z, t)
 
         ut_theta = self.model(x, t, y)
         ut_ref   = self.path.conditional_vector_field(x, z, t)
 
-        # MSE averaged over spatial dims, then over batch
-        return torch.sum(torch.square(ut_theta - ut_ref), dim=[1, 2, 3]).mean()
+        return _mean_flat_mse(ut_theta, ut_ref)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +226,7 @@ class DiffusionTrainer(Trainer):
         x0, y = self.path.p_data.sample(batch_size)
         x0 = x0.to(self.device)
 
-        t = torch.rand(batch_size, 1, 1, 1, device=self.device)
+        t = _sample_time_like(x0)
         xt, noise = self.path.q_sample(x0, t)
 
         target = self.path.get_target(x0, noise, t)
@@ -210,7 +237,7 @@ class DiffusionTrainer(Trainer):
         else:
             prediction = self.model(xt, t, **cond_kwargs)
 
-        return torch.sum(torch.square(prediction - target), dim=[1, 2, 3]).mean()
+        return _mean_flat_mse(prediction, target)
 
 
 # ---------------------------------------------------------------------------
@@ -256,10 +283,10 @@ class RectifiedFlowTrainer(Trainer):
         x0, _ = self.path.p_simple.sample(batch_size)
         x0 = x0.to(self.device)
 
-        t = torch.rand(batch_size, 1, 1, 1, device=self.device)
+        t = _sample_time_like(z)
         xt = (1.0 - t) * x0 + t * z          # linear interpolation
         target = z - x0                        # constant velocity
 
         prediction = self.model(xt, t)
 
-        return torch.sum(torch.square(prediction - target), dim=[1, 2, 3]).mean()
+        return _mean_flat_mse(prediction, target)
